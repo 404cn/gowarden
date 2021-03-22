@@ -1,0 +1,702 @@
+* Bitwarden API Overview
+
+[[https://github.com/jcs/rubywarden/blob/master/API.md][原文]]
+
+尽管开源了, 但是 [[https://github.com/bitwarden/core][.NET Bitwarden API code ]]依然很难从较高的层次游览与理解, 也没有相应的 API
+endpoints 文档来描述加密解密是如何实现的.
+
+以下的笔记是通过运行 [[https://github.com/jcs/rubywarden/blob/master/tools/mitm.rb][mitm]] 并用 ~http://127.0.0.1:4567/~ 为URL来跟踪与分析 Firefox 插件与
+Bitwarden 服务端的通信得到的.
+
+关于密匙与加密/解密的详细信息是通过阅读 [[https://github.com/bitwarden/browser][web插件源码]] 得到的.
+
+=可能由于版本更新或官方服务器与自建服务器的区别, 某些数据或者 AIP ENDPOINT 可能会与原文不同, 如果发现哪里写错欢迎提交ISSUE.=
+
+** 密码的哈希与加密密匙的推导
+
+概括:
+
+  - 使用 ~$KdfIterations~ 次的 [[https://en.wikipedia.org/wiki/PBKDF2][PBKDF2算法]] 将用户的 master key 与加了盐的 e-mail 地址
+    加密为 master key(服务器端未知).
+  - 生成64个随机的字节作为对称密匙,前一半用来做加密密匙, 后一半作为 MAC 密匙.
+  - 使用 AES-256-CBC, master key 与16字节随机的IV加密对称密匙, "输出+IV" 将作为
+    "受保护的对称密匙" 添加到用户的账户中, 存储在服务器端并在同步时发送到 Bitwarden 
+    的客户端应用.
+  - 存储的每个字符串的私有值都会被对称密匙进行加密(称为 "Cipher" obejects), 只能通过用户
+    的受保护的对称密匙与 master key 才能解密.
+
+改变用户的密码或 e-mail 会创建一个新的 master key, 然后用已经存在的对称密匙重新加密, 再
+创建一个新的受保护密匙, 这样就可以解密所有已经存在的 Cipher object 字符串.
+
+*例子*
+
+假设用户输入的 ~$masterPassword~ 是 ~p4ssw0rd~, ~$email~ 是 ~nobody@example.com~
+
+PBKDF2算法使用 ~$masterPassword~ 作为 password, 全小写的 ~$email~ 作为盐, ~$iterations~
+作为 KDF 迭代数将密码加密为 ~$masterKey~.
+
+#+BEGIN_SRC ruby
+def makeKey(password, salt, iterations)
+  PBKDF2.new(:password => password, :salt => salt,
+    :iterations => iterations, :hash_function => OpenSSL::Digest::SHA256,
+    :key_length => (256 / 8)).bin_string
+end
+
+irb> $masterKey = makeKey("p4ssw0rd", "nobody@example.com".downcase, 5000)
+=> "\x13\x88j`\x99m\xE3FA\x94\xEE'\xF0\xB2\x1A!\xB6>\\)\xF4\xD5\xCA#\xE5\e\xA6f5o{\xAA"
+#+END_SRC
+
+这样就创建了一个随机的, 64字节的对称密匙 ~$symmetricKey~. 前32字节作为 ~$encKey~, 后32字节作为 
+~$macKey~. 同时也创建了一个随机的16字节 IV ~$iv~, 而 ~$masterKey~ 则被用来作为加密 
+~$symmetricKey~ 的密匙.
+
+通过使用 [[https://github.com/bitwarden/browser/blob/f1262147a33f302b5e569f13f56739f05bbec362/src/services/constantsService.js#L13-L21][encryption type]] (~0~ 代表 ~AesCbc256_B64~) 经过Base64编码的 IV、 ~$encKey~ 与 ~$macKey~ 与竖线(~|~)结合在一起创建
+"CipherString" (一种Bitwarden的内部结构)作为 ~$protectedKey~.
+
+#+BEGIN_SRC ruby
+def cipherString(enctype, iv, ct, mac)
+  [ enctype.to_s + "." + iv, ct, mac ].reject{|p| !p }.join("|")
+end
+
+# encrypt random bytes with a key to make new encryption key
+def makeEncKey(key)
+  # pt[0, 32] becomes the cipher encryption key
+  # pt[32, 32] becomes the mac key
+  pt = OpenSSL::Random.random_bytes(64)
+  iv = OpenSSL::Random.random_bytes(16)
+
+  cipher = OpenSSL::Cipher.new "AES-256-CBC"
+  cipher.encrypt
+  cipher.key = key
+  cipher.iv = iv
+  ct = cipher.update(pt)
+  ct << cipher.final
+
+  return cipherString(0, Base64.strict_encode64(iv), Base64.strict_encode64(ct), nil)
+end
+
+irb> $protectedKey = makeEncKey($masterKey)
+=> "0.uRcMe+Mc2nmOet4yWx9BwA==|PGQhpYUlTUq/vBEDj1KOHVMlTIH1eecMl0j80+Zu0VRVfFa7X/MWKdVM6OM/NfSZicFEwaLWqpyBlOrBXhR+trkX/dPRnfwJD2B93hnLNGQ="
+#+END_SRC
+
+这就是与用户相关的主密匙并且会在账户创建后发送到服务器, 并在同步后发送回设备.
+
+在账户创建与登录时一个扩展密码的hash值 ~$masterPasswordHash~ 也会发送到服务器用来验证用户
+的账户. 这个hash值是通过将 ~$masterKey~ (使用(~$masterPassword~, ~$email~)进行5000次的
+PBKDF2加密得到) 与 ~masterPassword~ 的盐进行一轮 PBKDF2 加密得到的.
+
+#+BEGIN_SRC  ruby
+# base64-encode a wrapped, stretched password+salt for signup/login
+def hashedPassword(password, salt, kdf_iterations)
+  key = makeKey(password, salt, kdf_iterations)
+  Base64.strict_encode64(PBKDF2.new(:password => key, :salt => password,
+    :iterations => 1, :key_length => 256/8,
+    :hash_function => OpenSSL::Digest::SHA256).bin_string)
+end
+
+irb> $masterPasswordHash = hashedPassword("p4ssw0rd", "nobody@example.com", 5000)
+=> "r5CFRR+n9NQI8a525FY+0BPR0HGOjVJX0cR1KEMnIOo="
+#+END_SRC
+
+之后, 登录时就可以使用用户文本形式的 ~$masterPassword~ 和 ~$email~ 计算出 ~$masterKey~ , 
+然后将 ~$masterPassword~ 从内存中清除. 使用 ~$masterKey~ 为服务器返回的 ~$protectedKey~ 
+解密, 使用 ~$encKey~ 与 ~$macKey~ 为每一条内容加密. ~$masterPassword~ 与 ~$masterKey~ 应该
+永远留在设备中.
+
+** "Cipher" 的加密与解密
+
+Bitwarden将个别项视为 "cipher" 类型(例如网站登录、安全笔记、信用卡等等), 这个 [[https://github.com/bitwarden/browser/blob/f1262147a33f302b5e569f13f56739f05bbec362/src/services/constantsService.js#L22-L27][type]] 的值
+要表明它是什么. 每个 cipher 都有许多键/值对, 其中某些值是被加密的:
+
+#+BEGIN_SRC  json
+{
+	"type": 1,
+	"folderId": null,
+	"organizationId": null,
+	"name":"2.zAgCKbTvGowtaRn1er5WGA==|oVaVLIjfBQoRr5EvHTwfhQ==|lHSTUO5Rgfkjl3J/zGJVRfL8Ab5XrepmyMv9iZL5JBE=",
+	"notes":"2.NLkXMHtgR8u9azASR4XPOQ==|6/9QPcnoeQJDKBZTjcBAjVYJ7U/ArTch0hUSHZns6v8=|p55cl9FQK/Hef+7yzM7Cfe0w07q5hZI9tTbxupZepyM=",
+	"favorite": false,
+	"login": {
+		"uris": [
+			{
+				"uri": "2.6DmdNKlm3a+9k/5DFg+pTg==|7q1Arwz/ZfKEx+fksV3yo0HMQdypHJvyiix6hzgF3gY=|7lSXqjfq5rD3/3ofNZVpgv1ags696B2XXJryiGjDZvk=",
+				"match": null
+			}
+		],
+		"username": "2.4Dwitdv4Br85MABzhMJ4hg==|0BJtHtXbfZWwQXbFcBn0aA==|LM4VC+qNpezmub1f4l1TMLDb9g/Q+sIis2vDbU32ZGA=",
+		"password": "2.OOlWRBGib6G8WRvBOziKzQ==|Had/obAdd2/6y4qzM1Kc/A==|LtHXwZc5PkiReFhkzvEHIL01NrsWGvintQbmqwxoXSI=",
+		"totp": null
+	}
+}
+#+END_SRC
+
+其中 ~name~, ~notes~, ~login.uris[0].uri~, ~login.username~ 和 ~login.password~ 的值都是
+被作为 "CipherString" 
+加密后的, 前面的 ~2~ 代表它的类型(~AesCbc256_HmacSha255_B64~).
+
+想要解密其值, 需先将 CipherString 分解为 IV, cipher text 和 MAC, 再将各个部分进行
+Base64解码. 使用 ~$macKey~ 可以计算出MAC, 并将其与当前的MAC对比, 如果相等, 则使用 
+~$encKey~ 将 cipher text 解码.
+
+#+BEGIN_SRC  ruby
+# compare two hmacs, with double hmac verification
+# https://www.nccgroup.trust/us/about-us/newsroom-and-events/blog/2011/february/double-hmac-verification/
+def macsEqual(macKey, mac1, mac2)
+  hmac1 = OpenSSL::HMAC.digest(OpenSSL::Digest.new("SHA256"), macKey, mac1)
+  hmac2 = OpenSSL::HMAC.digest(OpenSSL::Digest.new("SHA256"), macKey, mac2)
+  return hmac1 == hmac2
+end
+
+# decrypt a CipherString and return plaintext
+def decrypt(str, key, macKey)
+  if str[0].to_i != 2
+    raise "implement #{str[0].to_i} decryption"
+  end
+
+  # AesCbc256_HmacSha256_B64
+  iv, ct, mac = str[2 .. -1].split("|", 3)
+
+  iv = Base64.decode64(iv)
+  ct = Base64.decode64(ct)
+  mac = Base64.decode64(mac)
+
+  cmac = OpenSSL::HMAC.digest(OpenSSL::Digest.new("SHA256"), macKey, iv + ct)
+  if !macsEqual(macKey, mac, cmac)
+    raise "invalid mac"
+  end
+
+  cipher = OpenSSL::Cipher.new "AES-256-CBC"
+  cipher.decrypt
+  cipher.iv = iv
+  cipher.key = key
+  pt = cipher.update(ct)
+  pt << cipher.final
+  pt
+end
+
+irb> decrypt("2.6DmdNKlm3a+9k/5DFg+pTg==|7q1Arwz/ZfKEx+fksV3yo0HMQdypHJvyiix6hzgF3gY=|7lSXqjfq5rD3/3ofNZVpgv1ags696B2XXJryiGjDZvk=", $encKey, $macKey)
+=> "https://example.com/login"
+#+END_SRC
+
+在生成了随机的16字节 IV ~$iv~, 使用 ~$encKey~ 将文本加密为 ~$cipherText~ 后加密的工作就结
+束了. MAC ~$mac~ 则是通过(~$iv + $cipherText~)计算得来的. 其中 ~$iv~, ~$cipherText~, 与 
+~$mac~ 都是经过Base64编码并使用竖线(~|~)连接在一起, 然后在字符串的开头增加类型(~2.~)从而生成
+一个 CipherString.
+
+#+BEGIN_SRC  ruby
+# encrypt+mac a value with a key and mac key and random iv, return cipherString
+def encrypt(pt, key, macKey)
+  iv = OpenSSL::Random.random_bytes(16)
+
+  cipher = OpenSSL::Cipher.new "AES-256-CBC"
+  cipher.encrypt
+  cipher.key = key
+  cipher.iv = iv
+  ct = cipher.update(pt)
+  ct << cipher.final
+
+  mac = OpenSSL::HMAC.digest(OpenSSL::Digest.new("SHA256"), macKey, iv + ct)
+
+  cipherString(2, Base64.strict_encode64(iv), Base64.strict_encode64(ct), Base64.strict_encode64(mac))
+end
+
+irb> encrypt("A secret note here...", $encKey, $macKey)
+=> "2.NLkXMHtgR8u9azASR4XPOQ==|6/9QPcnoeQJDKBZTjcBAjVYJ7U/ArTch0hUSHZns6v8=|p55cl9FQK/Hef+7yzM7Cfe0w07q5hZI9tTbxupZepyM="
+#+END_SRC
+
+** API
+*** URLs
+
+默认情况下, Bitwardens使用 ~$bitwarden.com~ 的三个不同的子域名, 其中 ~$baseURL~ 进行
+最多的 API 操作, ~$identityURL~ 处理登录(由于某种原因没有注册的情况下)和一些第三方
+(OAuth tokens)的问题, ~$iconURL~ 则只处理抓取, 缓存与请求网站图标的服务.
+
+如果在app中登录之前配置了自己架设的服务环境时, 则这三个都会被设置为相同的URL.
+
+*** 注册
+
+在拿到 e-mail 地址与用户 master password 之后使用它们计算出 ~$internalKey~, 
+~$masterPasswordHash~ 和 ~$key~ (皆为 CipherString).
+
+#+BEGIN_SRC ruby
+irb> $internalKey = makeKey("p4ssw0rd", "nobody@example.com".downcase, 5000)
+=> "\x13\x88j`\x99m\xE3FA\x94\xEE'\xF0\xB2\x1A!\xB6>\\)\xF4\xD5\xCA#\xE5\e\xA6f5o{\xAA"
+
+irb> $masterPasswordHash = hashedPassword("p4ssw0rd", "nobody@example.com", 5000)
+=> "r5CFRR+n9NQI8a525FY+0BPR0HGOjVJX0cR1KEMnIOo="
+
+irb> $key = makeEncKey($internalKey)
+=> "0.uRcMe+Mc2nmOet4yWx9BwA==|PGQhpYUlTUq/vBEDj1KOHVMlTIH1eecMl0j80+Zu0VRVfFa7X/MWKdVM6OM/NfSZicFEwaLWqpyBlOrBXhR+trkX/dPRnfwJD2B93hnLNGQ="
+#+END_SRC
+
+内存中的 ~$masterPassword~ 应被安全的移除, 因为直到下一次登录之前都不需要使用它了.
+
+向 ~$baseURL/api/accounts/register~ (+$baseURL/accounts/register+) 提交一个 ~POST~ 请求, 请求体是一个包含 e-mail 地址, 
+~$masterPasswordHash~, KDF的迭代次数 ~$kdfIterations~, 和一个 ~$key~ (不是 
+~$internalKey~ !!!):
+
+=在通过wireshark抓包后发现还有一个包含publicKey与encryptedPrivateKey的keys, 暂时不知道是干什么用的.=
+
+#+BEGIN_SRC  json
+POST $baseURL/api/accounts/register 
+Content-type: application/json
+
+{
+	"name": null,
+	"email": "nobody@example.com",
+	"masterPasswordHash": "r5CFRR+n9NQI8a525FY+0BPR0HGOjVJX0cR1KEMnIOo=",
+	"masterPasswordHint": null,
+	"key": "0.uRcMe+Mc2nmOet4yWx9BwA==|PGQhpYUlTUq/vBEDj1KOHVMlTIH1eecMl0j80+Zu0VRVfFa7X/MWKdVM6OM/NfSZicFEwaLWqpyBlOrBXhR+trkX/dPRnfwJD2B93hnLNGQ=",
+	"kdf": 0,
+	"kdfIterations": 5000,
+  "keys": {
+    "publicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy/3wxRAlBDtLCnNJOgYRPsv+EwH/+63UvngKyH5lAQwHZPYXELFhyI0DQxrlfoKda5aN8RKA36z0GcQUoAxgj4KTuf7w+KkL3fx6Uc97D2akxhbhqSsLfLJg2nUKQHtwcxtPfzFovQUeZFtdrqFhI/GawQxqea+Ym2DK4KC8hweSRH+6QDTB8JYKyPb/hyVM2rV2STvj+Q3fFTSknE0aA5V+yrGkPcWmK2tgCOIBZvhw3iVxjX94LS3H2AsF3wJtraThj667b97K7BXxpAKqKuWBdXxDdB2Kvq222VKCv7ybOwgLDGVbrAes6esOU0PEu4jWUzGpXAgjFPYlcoiguQIDAQAB"",
+    "encryptedPrivateKey": "2.Lau9fuSo3iNlZP7SH+q9qA==|W1M6cJPEcT16jynp09w+ACuzgpp7UypE+8d8LuBpoZlxyLH2zJGmeSv9j0xrdl0uS51w4BdYSZl7JcbR3FFOoincYmWROKvT2ueDPG1lmY3wq3Tlgl6dqLWQ+8pOXNc6v0XT3ySBRKxwLJP0ur9nT3X67tPDDCYRe0tLL/gBsyYc+9NQZRpfk0xPHU+1s4kywxmsx4sqrlESIB+hhHtm2hlmMZ8/W1h04Fly4wNrw9LDUgIVuQZ6h+i88TzqCYwQ54OV0CcANG5hqNizVbyczBkyJo4z/ClD2blzPMJ63Zlfk1p0zEGP6CwWDmyWAGMhTN3geUluvVXGBv64LougX1jBNRLLYhazJ4M0Jof42a1qErooMJZcb3d2seQ+SRmybQjdobhwmb0kRg2gXvfMoQXoPqeGMDkSrS9h01yTfTZWwMpKif+FJS4AliEil/6HlTknQseDdZGu58gAPZAW/AuLlRo3vomoJT6xfKx5dMbIOXqcy1Sa2uaFZ3A3zC/7iTmVQaooYM5a54d2hHkGrs+hpsf7TteX5uCxioxnD4hOMAUwOzYDHcC/otSVirc03enBpF4V5LuCDXMPEa3vFruKfX827lf73kXQnZJZauROOTU31h5WqLbaLV6Qs/NvfS/X0ka3LTqvb1F3MpymdByIQ9tpa/oFwRwVijuHnHqueQS2XCEQSQsvpLDEYb1Y7hqqLpHLGXH+sU/x+8AVIn6T7phjKFooCVLhILXCBYes3X5bvpA0qNu/MEfM+dnPsN+vamgOgPE2dwslMte8GCItUag/ktAxQYhKvtcmhdk0rp2s5Yw+iibRxZs2LEoehB6aD9EMgV2erUedkx43nTSQYnLYx/j40R3vn9+FJWrKequVDTgvi8JmshoQd3wAdxfeAb3JFzkw8mC4zG7yQQUXjO41akKPfajKu9PEc9x5bdjyMXoJdDYBF7exNmu1vjw8N0oPVmBYJoiMQPtiatMAUwogeNCLBcthTgLqPaomacvw7SKRSHHAyNnxJl/elc/ZyHqF1qCplJayDpUIz9TLw8S/M2GIfs+OqD6HKlxUvAkCS0/M7FOc28JYFvTvhWsJSXMszWuJcyu6HERiwfvq0rzHHSYh//vhrgqej+BM8rnV16bCMkbpxyNtrjGmBVecmqqUJpdoTOzI5nEE7I9BQlFYXrCNOMrjKETYI9SbTbkBYxEXlUuYf4O9Bor6rimQKcJMqGvmUUk4A5qgKDoT+HZhZHYXdzQ2OLnm+NEtULYwRMLDS5+mmV/whkn630SA55HTSJTVvdbcW4Ui8YtA07n4TiFLGP7h3OqhGmfChPWjlIbgXV8rJPYfJcI8AEYfCxjn+yPzuU0Z0+q0P7sb1tokkRevSt3keYus2JRH6KD/BeetnvmdYOLQx/4WgVbQiAsQjRWW4VXHAT4/Ag7uLbh+Zk1Xg46NSYy3Qo4DvVXObnst7qetvZf3TGrQd7OtDHtBl/lebWKA4yWGCWPUiiklZzn6QoHODdX6LQpIHXbPFteI45HGEniP+6KkvxFzEJyfWd4S3D2ECzJoixOzXJtL0pA74JbZGJJanQWraVlstann932NdTQQkC6VPL9zkIJl9PKyGiUnmWrbgpMmNtOjkq/EuJKwALnOt/c=|VQqHrcfSUll9+dOCIEw/0JlwRTp4coadspinBIjNM/Q="
+  }
+}
+#+END_SRC
+ 
+响应应为 ~200~ 和一个空的相应体.
+*** 登录
+
+首先拿到 e-mail 地址与主密码, 然后向 ~$baseURL/api/accounts/prelogin~ 发送一个 ~POST~ 
+请求获得给定 e-mail 地址的KDF迭代次数:
+
+#+BEGIN_SRC json
+POST $baseURL/api/accounts/prelogin
+Content-type: application/json
+
+{
+	"email": "nobody@example.com"
+}
+#+END_SRC
+
+~prelogin~ 响应会给出KDF迭代次数:
+
+#+BEGIN_SRC json
+{
+	"Kdf": 0,
+	"KdfIterations": 5000
+}
+#+END_SRC
+
+当得到KDF迭代次数后, 通过以下三个值计算出 ~$internalKey~ 和 ~$masterPasswordHash~ :
+
+#+BEGIN_SRC ruby
+irb> $internalKey = makeKey("p4ssw0rd", "nobody@example.com".downcase, 5000)
+=> "\x13\x88j`\x99m\xE3FA\x94\xEE'\xF0\xB2\x1A!\xB6>\\)\xF4\xD5\xCA#\xE5\e\xA6f5o{\xAA"
+
+irb> $masterPasswordHash = hashedPassword("p4ssw0rd", "nobody@example.com", 5000)
+=> "r5CFRR+n9NQI8a525FY+0BPR0HGOjVJX0cR1KEMnIOo="
+#+END_SRC
+
+随后主密码会从内存中安全的删除, 因为直到下一次登录之前都不需要使用它了.
+
+之后提交 ~POST~ 请求到 ~$identityURL/identity/connect/token~ (+$identityURL/connect/token+) (不是 ~$baseURL~).
+
+~deviceIdentifier~ 是设备在登陆时生成的随机的 UUID. [[https://github.com/bitwarden/core/blob/c9a2e67d0965fd046a0b3099e9511c26f0201acd/src/Core/Enums/DeviceType.cs][Firefox]] 的 ~deviceType~ 是 ~2~.
+
+=原文中最后还有一个 "devicePushToken", 但我在抓包时只有前八个字段.=
+
+#+BEGIN_SRC json
+POST $identityURL/identity/connect/token
+Content-type: application/x-www-form-urlencoded
+
+{
+	"grant_type": "password",
+	"username": "nobody@example.com",
+	"password": "r5CFRR+n9NQI8a525FY+0BPR0HGOjVJX0cR1KEMnIOo=",
+	"scope": "api offline_access",
+	"client_id": "browser",
+	"deviceType": 3,
+	"deviceIdentifier": "aac2e34a-44db-42ab-a733-5322dd582c3d",
+	"deviceName": "firefox"
+}
+#+END_SRC
+
+登陆成功后会得到 ~200~ 状态码和一个JSON响应:
+
+#+BEGIN_SRC json
+{
+	"access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkJDMz[...](JWT string)",
+	"expires_in": 3600,
+	"token_type": "Bearer",
+	"refresh_token": "28fb1911ef6db24025ce1bae5aa940e117eb09dfe609b425b69bff73d73c03bf",
+	"Key": "0.uRcMe+Mc2nmOet4yWx9BwA==|PGQhpYUlTUq/vBEDj1KOHVMlTIH1eecMl0j80+Zu0VRVfFa7X/MWKdVM6OM/NfSZicFEwaLWqpyBlOrBXhR+trkX/dPRnfwJD2B93hnLNGQ="
+}
+#+END_SRC
+
+如果账户开启了 2FA(必须通过Bitwarden网站上的bitwarden.com账户完成此操作, 或通过其他
+机制处理私人账户), 响应的状态码会是 ~400~ 并且json响应会带有一个包含可用服务的 [[https://github.com/bitwarden/browser/blob/f1262147a33f302b5e569f13f56739f05bbec362/src/services/constantsService.js#L33-L40][provider IDs]] 
+的非空数组 ~TwoFactorProviders~ :
+
+#+BEGIN_SRC json
+{
+	"error": "invalid_grant",
+	"error_description": "Two factor required.",
+	"TwoFactorProviders": [ 0 ],
+	"TwoFactorProviders2": { "0" : null }
+}
+#+END_SRC
+
+Bitwarden的客户端会提示输入 2FA 令牌, 然后用得到的 ~twoFactorProvider~ 和 ~twoFactorToken
+再次向 ~$identityURL/connect/token~ 登陆:
+
+#+BEGIN_SRC json
+POST $identityURL/connect/token
+Content-type: application/x-www-form-urlencoded
+
+{
+	"grant_type": "password",
+	"username": "nobody@example.com",
+	"password": "r5CFRR+n9NQI8a525FY+0BPR0HGOjVJX0cR1KEMnIOo=",
+	"scope": "api offline_access",
+	"client_id": "browser",
+	"deviceType": 3,
+	"deviceIdentifier": "aac2e34a-44db-42ab-a733-5322dd582c3d",
+	"deviceName": "firefox",
+	"devicePushToken": ""
+	"twoFactorToken": "123456",
+	"twoFactorProvider": 0,
+	"twoFactorRemember": 1,
+}
+#+END_SRC
+
+成功登陆开启了 2FA 的账户后, 会发送 ~PrivateKey~ 和 ~TwoFactorToken~ 的值但是不确定
+它们是做什么用的.
+
+#+BEGIN_SRC json
+{
+	"access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkJDMz[...](JWT string)",
+	"expires_in": 3600,
+	"token_type": "Bearer",
+	"refresh_token": "28fb1911ef6db24025ce1bae5aa940e117eb09dfe609b425b69bff73d73c03bf",
+	"PrivateKey": "2.WAfJirrIw2vPRIYZn/IadA==|v/PLyfn3P1YKDdbRCd+40k3Z[...](very long CipherString)",
+	"Key": "0.uRcMe+Mc2nmOet4yWx9BwA==|PGQhpYUlTUq/vBEDj1KOHVMlTIH1eecMl0j80+Zu0VRVfFa7X/MWKdVM6OM/NfSZicFEwaLWqpyBlOrBXhR+trkX/dPRnfwJD2B93hnLNGQ=",
+	"TwoFactorToken": "CfDJ8MXkSBvqpelMmq7HvH8L8fsvRsCETUwZQeOOXh21leQs2PmyuvuxdlhT95S+Otmn63gl6FNqLDL2gCqSNB+fHWTqdlX38GSWvGJimuAUeLu3Xgrd2Y0bEzjoBW+3YV4mHJPGwIu/2CaWZl6JW4F229x8fwYbPhRADczligiG1EFxbFswRwmZqmSny5o0VgKUHLIiSDfl2elHYzVpkkKYBoysX9pQ1NoYa7IJJReaWYoP"
+}
+#+END_SRC
+
+其中 ~access_token~, ~refresh_token~ 和 ~expires_in~ 必须保存用以之后的 API 访问.
+~$access_token~ 必须是一个 [[https://jwt.io/][JWT]] 字符串, 如果游览器插件想对其解码与解析则至少要有 ~nbf~,
+~exp~, ~iss~, ~sub~, ~email~, ~name~, ~premium~ 和 ~iss~ 的值. ~$access_token~ 在最长 
+~expires_in~ 秒里被作为 ~Authentication~ 发送, 之后需要将 ~$refresh_token~ 发送会身份
+验证服务器以获取新的 ~$access_token~.
+
+*** 同步
+ 
+客户端的同步为单向同步, 仅从服务器获取所有对象并更新本地数据.
+
+向 ~$baseURL/sync~ 发送一个 ~GET~ 请求, 并以 ~$access_token~ 作为 ~Authentication~ 的
+请求头.
+
+#+BEGIN_SRC 
+GET $baseURL/sync
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6IkJDMz(rest of $access_token)
+#+END_SRC
+
+成功后会得到一个包含 ~Profile~, ~Folders~, ~Ciphers~ 和 ~Domains~ 对象的JSON响应体:
+
+#+BEGIN_SRC json
+{
+	"Profile": {
+		"Id": "0fbfc68d-ba11-416a-ac8a-a82600f0e601",
+		"Name": null,
+		"Email": "nobody@example.com",
+		"EmailVerified": false,
+		"Premium": false,
+		"MasterPasswordHint": null,
+		"Culture": "en-US",
+		"TwoFactorEnabled": false,
+		"Key": "0.uRcMe+Mc2nmOet4yWx9BwA==|PGQhpYUlTUq/vBEDj1KOHVMlTIH1eecMl0j80+Zu0VRVfFa7X/MWKdVM6OM/NfSZicFEwaLWqpyBlOrBXhR+trkX/dPRnfwJD2B93hnLNGQ=",
+		"PrivateKey": null,
+		"SecurityStamp": "5d203c3f-bc89-499e-85c4-4431248e1196",
+		"Organizations": [
+		],
+		"Object": "profile"
+	},
+	"Folders": [
+		{
+			"Id": "14220912-d002-471d-a364-a82a010cb8f2",
+			"Name": "2.tqb+y2z4ChCYHj4romVwGQ==|E8+D7aR5CNnd+jF7fdb9ow==|wELCxyy341G2F+w8bTb87PAUi6sdXeIFTFb4N8tk3E0=",
+			"RevisionDate": "2017-11-13T16:20:56.5633333",
+			"Object": "folder"
+		}
+	],
+	"Ciphers": [
+		{
+			"FolderId": null,
+			"Favorite": false,
+			"Edit": true,
+			"Id": "0f01a66f-7802-42bc-9647-a82600f11e10",
+			"OrganizationId": null,
+			"Type":1,
+			"Login":{
+				"Uris": [
+					{
+						"Uri": "2.6DmdNKlm3a+9k/5DFg+pTg==|7q1Arwz/ZfKEx+fksV3yo0HMQdypHJvyiix6hzgF3gY=|7lSXqjfq5rD3/3ofNZVpgv1ags696B2XXJryiGjDZvk=",
+						"Match": null,
+					},
+				],
+				"Username": "2.4Dwitdv4Br85MABzhMJ4hg==|0BJtHtXbfZWwQXbFcBn0aA==|LM4VC+qNpezmub1f4l1TMLDb9g/Q+sIis2vDbU32ZGA=",
+				"Password":"2.OOlWRBGib6G8WRvBOziKzQ==|Had/obAdd2/6y4qzM1Kc/A==|LtHXwZc5PkiReFhkzvEHIL01NrsWGvintQbmqwxoXSI=",
+				"Totp":null,
+			},
+			"Name": "2.zAgCKbTvGowtaRn1er5WGA==|oVaVLIjfBQoRr5EvHTwfhQ==|lHSTUO5Rgfkjl3J/zGJVRfL8Ab5XrepmyMv9iZL5JBE=",
+			"Notes": "2.NLkXMHtgR8u9azASR4XPOQ==|6/9QPcnoeQJDKBZTjcBAjVYJ7U/ArTch0hUSHZns6v8=|p55cl9FQK/Hef+7yzM7Cfe0w07q5hZI9tTbxupZepyM=",
+			"Fields": null,
+			"Attachments": null,
+			"OrganizationUseTotp": false,
+			"RevisionDate": "2017-11-09T14:37:52.9033333",
+			"Object":"cipher"
+		}
+	],
+	"Domains": {
+		"EquivalentDomains": null,
+		"GlobalEquivalentDomains": [
+			{
+				"Type": 2,
+				"Domains": [
+					"ameritrade.com",
+					"tdameritrade.com"
+				],
+				"Excluded": false
+			},
+			[...]
+		],
+		"Object": "domains"
+	},
+	"Object": "sync"
+}
+#+END_SRC
+
+*** Token 的刷新
+
+在登陆 ~$expires_in~ 秒后(或最后一次刷新 ~expires_in~ 后), ~$access_token~ 会到期并且
+必须被刷新, 使用 ~$refresh_token~ 向身份验证服务器发送一个 ~POST~ 请求并获取一个新的 
+~$access_token~.
+
+#+BEGIN_SRC json
+POST $identityURL/connect/token
+Content-type: application/x-www-form-urlencoded
+
+{
+	"grant_type": "refresh_token",
+	"client_id": "browser",
+	"refresh_token": "28fb1911ef6db24025ce1bae5aa940e117eb09dfe609b425b69bff73d73c03bf",
+}
+#+END_SRC
+
+成功后响应体中会包含带有新的 ~$access_token~ 和相同的 ~$refresh_token~ 的JSON.
+
+#+BEGIN_SRC json
+{
+	"access_token": "(new access token)",
+	"expires_in": 3600,
+	"token_type": "Bearer",
+	"refresh_token": "28fb1911ef6db24025ce1bae5aa940e117eb09dfe609b425b69bff73d73c03bf",
+}
+#+END_SRC
+
+*** 保存新的单元
+
+当新的单元(登陆，安全笔记等等)在设备上被创建时, 会向 ~$baseURL/ciphers~ 发送 ~POST~ 请求:
+
+#+BEGIN_SRC json
+POST $baseURL/ciphers
+Content-type: application/json
+Authorization: Bearer $access_token
+
+{
+	"type": 1,
+	"folderId": null,
+	"organizationId": null,
+	"name": "2.d7MttWzJTSSKx1qXjHUxlQ==|01Ath5UqFZHk7csk5DVtkQ==|EMLoLREgCUP5Cu4HqIhcLqhiZHn+NsUDp8dAg1Xu0Io=",
+	"notes": null,
+	"favorite": false,
+	"login": {
+		"uri": "2.T57BwAuV8ubIn/sZPbQC+A==|EhUSSpJWSzSYOdJ/AQzfXuUXxwzcs/6C4tOXqhWAqcM=|OWV2VIqLfoWPs9DiouXGUOtTEkVeklbtJQHkQFIXkC8=",
+		"username": "2.JbFkAEZPnuMm70cdP44wtA==|fsN6nbT+udGmOWv8K4otgw==|JbtwmNQa7/48KszT2hAdxpmJ6DRPZst0EDEZx5GzesI=",
+		"password": "2.e83hIsk6IRevSr/H1lvZhg==|48KNkSCoTacopXRmIZsbWg==|CIcWgNbaIN2ix2Fx1Gar6rWQeVeboehp4bioAwngr0o=",
+		"totp": null
+	}
+}
+#+END_SRC
+
+不出问题的话服务器会返回一个带有加密数据的JSON响应:
+
+#+BEGIN_SRC json
+{
+	"FolderId": null,
+	"Favorite": false,
+	"Edit": true,
+	"Id": "4c2869dd-0e1c-499f-b116-a824016df251",
+	"OrganizationId": null,
+	"Type": 1,
+	"Login": {
+		"Uris": [
+			{
+				"Uri": "2.T57BwAuV8ubIn/sZPbQC+A==|EhUSSpJWSzSYOdJ/AQzfXuUXxwzcs/6C4tOXqhWAqcM=|OWV2VIqLfoWPs9DiouXGUOtTEkVeklbtJQHkQFIXkC8=",
+				"Match": null,
+			},
+		],
+	},
+	"Username": "2.JbFkAEZPnuMm70cdP44wtA==|fsN6nbT+udGmOWv8K4otgw==|JbtwmNQa7/48KszT2hAdxpmJ6DRPZst0EDEZx5GzesI=",
+	"Password": "2.e83hIsk6IRevSr/H1lvZhg==|48KNkSCoTacopXRmIZsbWg==|CIcWgNbaIN2ix2Fx1Gar6rWQeVeboehp4bioAwngr0o=",
+	"Totp": null,
+	"Name": "2.d7MttWzJTSSKx1qXjHUxlQ==|01Ath5UqFZHk7csk5DVtkQ==|EMLoLREgCUP5Cu4HqIhcLqhiZHn+NsUDp8dAg1Xu0Io=",
+	"Notes": null,
+	"Fields": null,
+	"Attachments": null,
+	"OrganizationUseTotp": false,
+	"RevisionDate": "2017-11-07T22:12:22.235914Z",
+	"Object": "cipher"
+}
+#+END_SRC
+
+*** 更新单元
+
+向 ~$baseURL/ciphers/(cipher UUID)~ 发送 ~PUT~ 请求:
+
+#+BEGIN_SRC json
+PUT $baseURL/ciphers/(cipher UUID)
+Content-type: application/json
+Authorization: Bearer $access_token
+
+{
+	"type": 2,
+	"folderId": null,
+	"organizationId": null,
+	"name": "2.G38TIU3t1pGOfkzjCQE7OQ==|Xa1RupttU7zrWdzIT6oK+w==|J3C6qU1xDrfTgyJD+OrDri1GjgGhU2nmRK75FbZHXoI=",
+	"notes": "2.rSw0uVQEFgUCEmOQx0JnDg==|MKqHLD25aqaXYHeYJPH/mor7l3EeSQKsI7A/R+0bFTI=|ODcUScISzKaZWHlUe4MRGuTT2S7jpyDmbOHl7d+6HiM=",
+	"favorite": true,
+	"secureNote":{
+		"type": 0
+	}
+}
+#+END_SRC
+
+JSON响应与创建单元时相同.
+
+*** 删除单元
+
+向 ~$baseURL/ciphers/(cipher UUID)~ 发送一个空的 ~DELETE~ 请求:
+
+#+BEGIN_SRC 
+DELETE $baseURL/ciphers/(cipher UUID)
+Authorization: Bearer (access_token)
+#+END_SRC
+
+请求成功会反回长度为零的响应.
+
+*** 添加附件
+
+向 ~$baseURL/ciphers/(cipher UUID)/attachment~ 发送 ~POST~ 请求.
+
+It is a multipart/form-data post, with the file under the data-attribute 
+the single posted entity.
+
+#+BEGIN_SRC json
+POST $baseURL/ciphers/(cipher UUID)/attachment
+Content-type: application/json
+Authorization: Bearer $access_token
+{
+	"data": {
+		"filename": "encrypted_filename"
+		"tempfile": blob
+	}
+}
+#+END_SRC
+
+The JSON response will then be the complete cipher item, but now 
+containing an entry for the new attachment:
+
+#+BEGIN_SRC json
+{
+	"FolderId"=>nil,
+	...
+	"Data"=> ...,
+	"Attachments"=>
+	[
+		{	"Id"=>"7xytytjp1hc2ijy3n5y5vbbnzcukmo8b",
+				"Url"=> "https://cdn.bitwarden.com/attachments/(cipher UUID)/7xytytjp1hc2ijy3n5y5vbbnzcukmo8b",
+				"FileName"=> "2.GOkRA8iZio1KxB+UkJpfcA==|/Mc8ACbPr9CRRQmNKPYHVg==|4BBQf8YTbPupap6qR97qMdn0NJ88GdTgDPIyBsQ46aA=",
+				"Size"=>"65",
+				"SizeName"=>"65 Bytes",
+				"Object"=>"attachment"
+			}
+		],
+	...,
+	"Object"=>"cipher"
+}
+#+END_SRC
+
+*** 删除附件
+
+向 ~$baseURL/ciphers/(cipher UUID)/attachment/(attachment id)~ 发送一个空的
+~DELETE~ 请求:
+
+#+BEGIN_SRC 
+DELETE $baseURL/ciphers/(cipher UUID)/attachment/(attachment id)
+Authorization: Bearer (access_token)
+#+END_SRC
+
+成功后得到长度为0的响应.
+
+*** 下载一个附件
+
+$cdn_url 使用的是官方的服务器 [[https://cdn.bitwarden.com/]].
+
+向 ~$cdn_url/attachments/(cipher UUID)/(attachment id)~ 发送一个未验证身份的
+~GET~ 请求:
+
+#+BEGIN_SRC
+GET $cdn_url/attachments/(cipher UUID)/(attachment id)
+#+END_SRC
+
+该文件会作为响应发送.
+ 
+*** 文件夹
+
+通过向 ~$baseURL/folders~ 发送 ~POST~ 请求创建一个文件夹:
+
+#+BEGIN_SRC json
+POST $baseURL/folders
+Content-type: application/json
+Authorization: Bearer $access_token
+
+{
+	"name": "2.FQAwIBaDbczEGnEJw4g4hw==|7KreXaC0duAj0ulzZJ8ncA==|nu2sEvotjd4zusvGF8YZJPnS9SiJPDqc1VIfCrfve/o="
+}
+#+END_SRC
+
+JSON响应:
+
+#+BEGIN_SRC json
+{
+	"Id": "14220912-d002-471d-a364-a82a010cb8f2",
+	"Name": "2.FQAwIBaDbczEGnEJw4g4hw==|7KreXaC0duAj0ulzZJ8ncA==|nu2sEvotjd4zusvGF8YZJPnS9SiJPDqc1VIfCrfve/o=",
+	"RevisionDate": "2017-11-13T16:18:23.3078169Z",
+	"Object": "folder"
+}
+#+END_SRC
+
+想要重命名文件夹, 使用相同的结构向 ~$baseURL/folders/(folder UUID)~ 发送 ~POST~ 请求,
+会得到相同的结果.
+
+想要删除一个文件夹, 向 ~$baseURL/folders/(folder UUID)~ 发送 ~DELETE~ 请求并在成功
+后得到一个零长度的响应.
+
+*** 图标
+
+每个登陆密码都一个显示其URL的图标(favicon), 该图标是通过Bitwarden的服务器获取的(大概
+用于缓存).
+
+想要获取URL的图标, 向 ~$iconURL/(domain)/icon.png~ 发送未经身份验证的 ~GET~ 请求:
+
+#+BEGIN_SRC 
+GET $iconURL/google.com/icon.png
+(no authentication header)
+#+END_SRC
+
+返回的二进制响应中会包含图标.
